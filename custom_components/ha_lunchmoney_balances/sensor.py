@@ -2,6 +2,7 @@
 
 import logging
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 
 from homeassistant.components.sensor import (
     SensorEntity,
@@ -28,6 +29,10 @@ from .const import (
     ATTR_TO_BASE_CURRENCY,
     ATTR_DISPLAY_NAME,
     DEFAULT_ICON,
+    CONF_INVERTED_ASSET_TYPES,
+    DEFAULT_INVERTED_ASSET_TYPES,
+    NET_WORTH_SENSOR_ID_SUFFIX,
+    NET_WORTH_DEVICE_NAME,
     PLATFORMS,
 )
 
@@ -53,13 +58,17 @@ async def async_setup_entry(
     for asset_id, asset_data in coordinator.data.items():
         if asset_data:  # Ensure asset_data is not None
             entities.append(
-                LunchMoneyBalanceSensor(coordinator, asset_id, config_entry.entry_id)
+                LunchMoneyBalanceSensor(coordinator, asset_id, config_entry)
             )
         else:
             _LOGGER.warning(
                 "Asset data for ID %s is missing or invalid, skipping sensor creation.",
                 asset_id,
             )
+
+    # Create Net Worth sensor
+    # It can be created even if there are no assets (net worth would be 0)
+    entities.append(LunchMoneyNetWorthSensor(coordinator, config_entry))
 
     if entities:
         async_add_entities(entities, True)
@@ -81,12 +90,15 @@ class LunchMoneyBalanceSensor(CoordinatorEntity, SensorEntity):
     # _attr_icon = DEFAULT_ICON # Example if you have a single default icon for all balance sensors
 
     def __init__(
-        self, coordinator: DataUpdateCoordinator, asset_id: int, entry_id: str
+        self,
+        coordinator: DataUpdateCoordinator,
+        asset_id: int,
+        config_entry: ConfigEntry,
     ) -> None:
         """Initialize the sensor."""
         super().__init__(coordinator)
         self._asset_id = asset_id
-        self._entry_id = entry_id
+        self._config_entry = config_entry
         # Initial data fetch and attribute setting are handled by _handle_coordinator_update
         # called by CoordinatorEntity logic, and also explicitly called once here.
         self._update_internal_state()
@@ -105,7 +117,11 @@ class LunchMoneyBalanceSensor(CoordinatorEntity, SensorEntity):
                 asset_data, "name", f"Asset {self._asset_id}"
             )
             self._attr_name = f"{asset_name} Balance"  # Sensor name
-            self._attr_unique_id = f"{self._entry_id}_{self._asset_id}_balance"  # Unique ID for the sensor entity
+            self._attr_unique_id = f"{self._config_entry.entry_id}_{self._asset_id}_balance"  # Unique ID for the sensor entity
+
+            inverted_types = self._config_entry.options.get(
+                CONF_INVERTED_ASSET_TYPES, DEFAULT_INVERTED_ASSET_TYPES
+            )
 
             self._attr_native_value = self._parse_balance(
                 getattr(asset_data, "balance", None)
@@ -129,11 +145,16 @@ class LunchMoneyBalanceSensor(CoordinatorEntity, SensorEntity):
             else:
                 self._attr_icon = DEFAULT_ICON  # Fallback to default icon
 
+            if self._attr_native_value is not None and type_name in inverted_types:
+                self._attr_native_value = -self._attr_native_value
+
         else:  # Asset data not found
             self._attr_name = (
                 f"Lunch Money Asset {self._asset_id} Balance (Data Missing)"
             )
-            self._attr_unique_id = f"{self._entry_id}_{self._asset_id}_balance"
+            self._attr_unique_id = (
+                f"{self._config_entry.entry_id}_{self._asset_id}_balance"
+            )
             self._attr_native_value = None
             self._attr_native_unit_of_measurement = None
             self._attr_icon = "mdi:alert-circle-outline"  # Icon indicating an issue
@@ -143,8 +164,9 @@ class LunchMoneyBalanceSensor(CoordinatorEntity, SensorEntity):
         if balance_str is None:
             return None
         try:
-            return float(balance_str)
-        except (ValueError, TypeError):
+            # Using Decimal for precision before converting to float for HA state
+            return float(Decimal(balance_str))
+        except (InvalidOperation, ValueError, TypeError):
             _LOGGER.error(
                 "Could not parse balance '%s' for asset %s", balance_str, self._asset_id
             )
@@ -176,6 +198,10 @@ class LunchMoneyBalanceSensor(CoordinatorEntity, SensorEntity):
             manufacturer="Lunch Money",
             model=f"Asset ({asset_type})",
             configuration_url="https://my.lunchmoney.app/assets",  # Generic link to assets page
+            via_device=(
+                DOMAIN,
+                self._config_entry.entry_id,
+            ),  # Link to config entry device
             # You could add sw_version if lunchable exposes API version or similar
         )
 
@@ -198,8 +224,8 @@ class LunchMoneyBalanceSensor(CoordinatorEntity, SensorEntity):
             if value is not None:
                 if is_numeric:
                     try:
-                        attrs[attr_key_const] = float(value)
-                    except (ValueError, TypeError):
+                        attrs[attr_key_const] = float(Decimal(str(value)))
+                    except (InvalidOperation, ValueError, TypeError):
                         _LOGGER.debug(
                             "Could not parse numeric attribute %s: %s",
                             data_key_on_asset_obj,
@@ -256,6 +282,13 @@ class LunchMoneyBalanceSensor(CoordinatorEntity, SensorEntity):
         if self.native_unit_of_measurement:
             attrs["currency_code"] = self.native_unit_of_measurement
 
+        # Add whether this balance was inverted
+        inverted_types = self._config_entry.options.get(
+            CONF_INVERTED_ASSET_TYPES, DEFAULT_INVERTED_ASSET_TYPES
+        )
+        asset_type = getattr(asset_data, "type_name", "").lower()
+        attrs["balance_inverted"] = asset_type in inverted_types
+
         return attrs
 
     @callback
@@ -275,4 +308,142 @@ class LunchMoneyBalanceSensor(CoordinatorEntity, SensorEntity):
     @property
     def entity_registry_enabled_default(self) -> bool:
         """Return if the entity should be enabled when first added to the entity registry."""
+        return True
+
+
+# --- Net Worth Sensor ---
+class LunchMoneyNetWorthSensor(CoordinatorEntity, SensorEntity):
+    """Representation of the total Net Worth from Lunch Money assets."""
+
+    _attr_state_class = SensorStateClass.TOTAL
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_attribution = ATTRIBUTION
+    _attr_icon = "mdi:scale-balance"
+
+    def __init__(
+        self, coordinator: DataUpdateCoordinator, config_entry: ConfigEntry
+    ) -> None:
+        """Initialize the Net Worth sensor."""
+        super().__init__(coordinator)
+        self._config_entry = config_entry
+        self._attr_name = (
+            f"{NET_WORTH_DEVICE_NAME} Net Worth"  # Or derive from config_entry title
+        )
+        self._attr_unique_id = (
+            f"{self._config_entry.entry_id}_{NET_WORTH_SENSOR_ID_SUFFIX}"
+        )
+        self._update_internal_state()  # Initial update
+
+    def _get_user_data(self):
+        """Helper to safely get user data from the coordinator."""
+        if self.coordinator.data and "user" in self.coordinator.data:
+            return self.coordinator.data["user"]
+        return None
+
+    def _get_all_asset_data(self) -> dict:
+        """Helper to safely get all asset data from the coordinator."""
+        if self.coordinator.data and "assets" in self.coordinator.data:
+            return self.coordinator.data["assets"]
+        return {}
+
+    def _update_internal_state(self) -> None:
+        """Update the sensor's state."""
+        all_assets = self._get_all_asset_data()
+        user_data = self._get_user_data()
+
+        inverted_types = self._config_entry.options.get(
+            CONF_INVERTED_ASSET_TYPES, DEFAULT_INVERTED_ASSET_TYPES
+        )
+
+        total_net_worth = Decimal("0.0")  # Use Decimal for precision
+
+        if all_assets:
+            for asset_data in all_assets.values():
+                if not hasattr(asset_data, "to_base") or asset_data.to_base is None:
+                    _LOGGER.debug(
+                        "Asset %s (%s) missing 'to_base' value, skipping for net worth.",
+                        getattr(asset_data, "id", "N/A"),
+                        getattr(asset_data, "name", "N/A"),
+                    )
+                    continue
+
+                try:
+                    # Ensure to_base is treated as a string for Decimal conversion if it's float/int
+                    base_value = Decimal(str(asset_data.to_base))
+                    asset_type = getattr(asset_data, "type_name", "").lower()
+
+                    if asset_type in inverted_types:
+                        total_net_worth -= base_value
+                    else:
+                        total_net_worth += base_value
+                except (InvalidOperation, ValueError, TypeError) as e:
+                    _LOGGER.error(
+                        "Error processing to_base value '%s' for asset %s for net worth: %s",
+                        asset_data.to_base,
+                        getattr(asset_data, "id", "N/A"),
+                        e,
+                    )
+
+        self._attr_native_value = float(
+            total_net_worth
+        )  # Convert to float for HA state
+
+        if user_data and hasattr(user_data, "currency") and user_data.currency:
+            self._attr_native_unit_of_measurement = user_data.currency.upper()
+        else:
+            # Try to infer from first asset with a 'to_base' and 'currency' if user_data is missing currency
+            # This is a fallback, primary should be user_data.currency
+            self._attr_native_unit_of_measurement = (
+                None  # Default to None if not determinable
+            )
+            if all_assets:
+                for asset_data in all_assets.values():
+                    if (
+                        hasattr(asset_data, "to_base")
+                        and asset_data.to_base is not None
+                        and hasattr(asset_data, "currency")
+                        and asset_data.currency
+                    ):
+                        # This assumes the 'currency' of an asset might reflect the base currency,
+                        # which is not strictly true. user_data.currency is the correct source.
+                        # self._attr_native_unit_of_measurement = asset_data.currency.upper()
+                        # break
+                        pass  # Keep it None, rely on user_data.currency only
+
+    @property
+    def available(self) -> bool:
+        """Return True if entity is available (i.e., coordinator has data)."""
+        # Net worth sensor is available as long as the coordinator has run once,
+        # even if there are no assets (net worth would be 0).
+        # It primarily depends on the 'user' part for currency.
+        return (
+            super().available
+            and self.coordinator.data is not None
+            and "user" in self.coordinator.data
+        )
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Return information for the Net Worth device."""
+        return DeviceInfo(
+            identifiers={
+                (DOMAIN, f"{self._config_entry.entry_id}_summary")
+            },  # Unique ID for this summary device
+            name=NET_WORTH_DEVICE_NAME,
+            manufacturer="Lunch Money",
+            model="Account Summary",
+            via_device=(
+                DOMAIN,
+                self._config_entry.entry_id,
+            ),  # Links it to the main config entry device
+        )
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        self._update_internal_state()
+        self.async_write_ha_state()
+
+    @property
+    def entity_registry_enabled_default(self) -> bool:
         return True
