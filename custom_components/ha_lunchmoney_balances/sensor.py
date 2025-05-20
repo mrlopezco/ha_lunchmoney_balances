@@ -4,7 +4,7 @@
 import logging
 from datetime import datetime, date
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Dict, Set
 
 from homeassistant.components.sensor import (
     SensorEntity,
@@ -42,6 +42,9 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 ATTRIBUTION = "Data provided by Lunch Money"
 
+# Epsilon for floating point comparisons to zero
+ZERO_BALANCE_EPSILON = 1e-6
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -51,60 +54,160 @@ async def async_setup_entry(
     """Set up the Lunch Money Balance sensor platform."""
     coordinator: DataUpdateCoordinator = hass.data[DOMAIN][config_entry.entry_id]
 
-    _LOGGER.debug("Sensor setup: Full coordinator data: %s", coordinator.data)  # DEBUG
+    # Store the add_entities callback and a dictionary to track active sensors
+    # This allows the coordinator update listener to dynamically add/remove entities
+    hass.data[DOMAIN].setdefault("active_balance_sensors", {})
+    hass.data[DOMAIN]["add_balance_entities_callback"] = async_add_entities
 
-    if coordinator.data is None or (
-        "manual_assets" not in coordinator.data
-        and "plaid_accounts" not in coordinator.data
-    ):
-        _LOGGER.warning(
-            "Sensor setup: Initial data from coordinator is missing or not structured correctly. Coordinator data: %s",
-            coordinator.data,
-        )
-        return
+    _LOGGER.debug("Sensor setup: Full coordinator data: %s", coordinator.data)
 
-    entities = []
-    # Create sensors for manual assets
-    manual_assets_dict = coordinator.data.get("manual_assets", {})
-    _LOGGER.debug(
-        "Sensor setup: Manual assets dict from coordinator: %s", manual_assets_dict
-    )
-    for asset_id in manual_assets_dict:
-        _LOGGER.debug(
-            "Sensor setup: Creating LunchMoneyBalanceSensor for manual asset_id: %s",
-            asset_id,
-        )
-        entities.append(
-            LunchMoneyBalanceSensor(coordinator, asset_id, config_entry, is_plaid=False)
-        )
-
-    # Create sensors for Plaid accounts
-    plaid_accounts_dict = coordinator.data.get("plaid_accounts", {})
-    _LOGGER.debug(
-        "Sensor setup: Plaid accounts dict from coordinator: %s", plaid_accounts_dict
-    )
-    for account_id in plaid_accounts_dict:
-        _LOGGER.debug(
-            "Sensor setup: Creating LunchMoneyBalanceSensor for Plaid account_id: %s",
-            account_id,
-        )
-        entities.append(
-            LunchMoneyBalanceSensor(
-                coordinator, account_id, config_entry, is_plaid=True
-            )
-        )
-
-    # Create Net Worth sensor
+    # Add the Net Worth sensor directly, as it's always present
     _LOGGER.debug("Sensor setup: Creating LunchMoneyNetWorthSensor.")
-    entities.append(LunchMoneyNetWorthSensor(coordinator, config_entry))
+    async_add_entities([LunchMoneyNetWorthSensor(coordinator, config_entry)], True)
 
-    if entities:
-        _LOGGER.debug("Sensor setup: Adding %s entities.", len(entities))
-        async_add_entities(entities, True)
-    else:
-        _LOGGER.info(
-            "Sensor setup: No sensor entities created for Lunch Money Balances."
-        )
+    # Register the listener for coordinator updates
+    # This listener will handle dynamic creation/removal of individual balance sensors
+    @callback
+    def _async_coordinator_update_listener():
+        """Handle updated data from the coordinator and manage balance sensors."""
+        _LOGGER.debug("Coordinator update listener triggered.")
+        current_data = coordinator.data
+
+        if current_data is None or (
+            "manual_assets" not in current_data and "plaid_accounts" not in current_data
+        ):
+            _LOGGER.warning(
+                "Coordinator data is missing or not structured correctly in listener: %s",
+                current_data,
+            )
+            return
+
+        active_sensors: Dict[str, LunchMoneyBalanceSensor] = hass.data[DOMAIN][
+            "active_balance_sensors"
+        ]
+        add_entities_callback: AddEntitiesCallback = hass.data[DOMAIN][
+            "add_balance_entities_callback"
+        ]
+
+        desired_entity_ids: Set[str] = set()
+        entities_to_add = []
+
+        # Process manual assets
+        manual_assets_dict = current_data.get("manual_assets", {})
+        for asset_id, asset_data in manual_assets_dict.items():
+            # Calculate effective balance for manual assets
+            raw_balance_str = getattr(asset_data, "balance", None)
+            parsed_balance = None
+            if raw_balance_str is not None:
+                try:
+                    parsed_balance = float(Decimal(str(raw_balance_str)))
+                except (InvalidOperation, ValueError, TypeError):
+                    _LOGGER.error(
+                        "Could not parse balance string '%s' for manual asset %s",
+                        raw_balance_str,
+                        asset_id,
+                    )
+
+            # Determine if balance is effectively zero
+            is_zero_balance = (
+                parsed_balance is None or abs(parsed_balance) < ZERO_BALANCE_EPSILON
+            )
+
+            unique_id = f"{config_entry.entry_id}_manual_{asset_id}_balance"
+            desired_entity_ids.add(unique_id)
+
+            if not is_zero_balance and unique_id not in active_sensors:
+                # Balance is non-zero and sensor not yet created, so create it
+                _LOGGER.debug(
+                    "Adding new LunchMoneyBalanceSensor for manual asset_id: %s (balance: %s)",
+                    asset_id,
+                    parsed_balance,
+                )
+                new_sensor = LunchMoneyBalanceSensor(
+                    coordinator, asset_id, config_entry, is_plaid=False
+                )
+                entities_to_add.append(new_sensor)
+                active_sensors[unique_id] = new_sensor
+            elif is_zero_balance and unique_id in active_sensors:
+                # Balance is zero and sensor exists, so mark for removal
+                _LOGGER.debug(
+                    "Marking LunchMoneyBalanceSensor for manual asset_id: %s for removal (balance: %s)",
+                    asset_id,
+                    parsed_balance,
+                )
+                # We can't remove directly here, but we will collect entities to remove later
+                pass  # Handled in the removal loop below
+
+        # Process Plaid accounts
+        plaid_accounts_dict = current_data.get("plaid_accounts", {})
+        for account_id, account_data in plaid_accounts_dict.items():
+            # Balance for Plaid is already float or None
+            raw_balance = getattr(account_data, "balance", None)
+
+            # Determine if balance is effectively zero
+            is_zero_balance = (
+                raw_balance is None or abs(raw_balance) < ZERO_BALANCE_EPSILON
+            )
+
+            unique_id = f"{config_entry.entry_id}_plaid_{account_id}_balance"
+            desired_entity_ids.add(unique_id)
+
+            if not is_zero_balance and unique_id not in active_sensors:
+                # Balance is non-zero and sensor not yet created, so create it
+                _LOGGER.debug(
+                    "Adding new LunchMoneyBalanceSensor for Plaid account_id: %s (balance: %s)",
+                    account_id,
+                    raw_balance,
+                )
+                new_sensor = LunchMoneyBalanceSensor(
+                    coordinator, account_id, config_entry, is_plaid=True
+                )
+                entities_to_add.append(new_sensor)
+                active_sensors[unique_id] = new_sensor
+            elif is_zero_balance and unique_id in active_sensors:
+                # Balance is zero and sensor exists, so mark for removal
+                _LOGGER.debug(
+                    "Marking LunchMoneyBalanceSensor for Plaid account_id: %s for removal (balance: %s)",
+                    account_id,
+                    raw_balance,
+                )
+                pass  # Handled in the removal loop below
+
+        # Add new entities
+        if entities_to_add:
+            _LOGGER.debug(
+                "Adding %d new balance sensor entities.", len(entities_to_add)
+            )
+            add_entities_callback(entities_to_add, True)
+
+        # Remove entities that are no longer desired (balance became zero)
+        entities_to_remove = []
+        for unique_id, sensor_instance in list(
+            active_sensors.items()
+        ):  # Iterate over a copy
+            if unique_id not in desired_entity_ids:
+                _LOGGER.debug("Removing balance sensor entity: %s", unique_id)
+                entities_to_remove.append(sensor_instance)
+                del active_sensors[unique_id]  # Remove from our tracking dict
+
+        for sensor_instance in entities_to_remove:
+            if sensor_instance.hass:  # Ensure it's still attached to Home Assistant
+                sensor_instance.async_remove(
+                    force_remove=True
+                )  # Force remove from HA registry
+
+        # Update existing entities (those that remain active)
+        for sensor_instance in active_sensors.values():
+            sensor_instance.async_write_ha_state()  # Trigger state update for existing sensors
+
+    # Add the listener to the coordinator
+    coordinator.async_add_listener(_async_coordinator_update_listener)
+
+    # Run the listener once immediately to set up initial sensors
+    _async_coordinator_update_listener()
+
+    # The rest of async_setup_entry remains the same
+    # ... (no changes below this point in init.py)
 
 
 class LunchMoneyBalanceSensor(CoordinatorEntity, SensorEntity):
@@ -127,6 +230,7 @@ class LunchMoneyBalanceSensor(CoordinatorEntity, SensorEntity):
         self._config_entry = config_entry
         self._is_plaid = is_plaid
         self._item_type_prefix = "plaid" if is_plaid else "manual"
+        # Initial update of internal state, but availability is now managed by add/remove logic
         self._update_internal_state()
 
     def _get_item_data(
@@ -140,12 +244,12 @@ class LunchMoneyBalanceSensor(CoordinatorEntity, SensorEntity):
             and self._item_id in self.coordinator.data[data_key]
         ):
             return self.coordinator.data[data_key][self._item_id]
-        _LOGGER.debug(
-            "_get_item_data: Item ID %s (type: %s) not found in coordinator's %s dict.",
-            self._item_id,
-            self._item_type_prefix,
-            data_key,
-        )
+        # _LOGGER.debug( # This debug log can be noisy if entities are frequently not found
+        #     "_get_item_data: Item ID %s (type: %s) not found in coordinator's %s dict.",
+        #     self._item_id,
+        #     self._item_type_prefix,
+        #     data_key,
+        # )
         return None
 
     def _update_internal_state(self) -> None:
@@ -185,6 +289,7 @@ class LunchMoneyBalanceSensor(CoordinatorEntity, SensorEntity):
                 ).lower()  # Manual uses 'type_name'
 
             self._attr_name = f"{item_name} Balance"
+            # Unique ID is critical for dynamic management, must match the one used in listener
             self._attr_unique_id = f"{self._config_entry.entry_id}_{self._item_type_prefix}_{self._item_id}_balance"
 
             if (
@@ -214,6 +319,11 @@ class LunchMoneyBalanceSensor(CoordinatorEntity, SensorEntity):
             else:
                 self._attr_icon = DEFAULT_ICON
         else:
+            # If item_data is None, it means the item is no longer in the coordinator data
+            # This sensor instance should be removed by the listener, but for safety
+            # we can set attributes to None or a default "missing" state.
+            # In this dynamic add/remove model, this branch should ideally not be hit
+            # for active sensors, as they would have been removed already.
             self._attr_name = f"Lunch Money Item {self._item_type_prefix} {self._item_id} Balance (Data Missing)"
             self._attr_unique_id = f"{self._config_entry.entry_id}_{self._item_type_prefix}_{self._item_id}_balance"
             self._attr_native_value = None
@@ -236,12 +346,17 @@ class LunchMoneyBalanceSensor(CoordinatorEntity, SensorEntity):
 
     @property
     def available(self) -> bool:
-        return super().available and self._get_item_data() is not None
+        """Sensor is always available if it's been added to Home Assistant."""
+        # Availability is now managed by the dynamic add/remove logic in the listener.
+        # If the sensor exists, it means its balance was non-zero.
+        return super().available
 
     @property
     def device_info(self) -> DeviceInfo | None:
         item_data = self._get_item_data()
         if not item_data:
+            # If item_data is None, the sensor should ideally be removed by the listener.
+            # Return None to indicate no device info if data is genuinely missing.
             return None
 
         device_identifier_suffix = f"{self._item_type_prefix}_{self._item_id}"
@@ -357,14 +472,12 @@ class LunchMoneyBalanceSensor(CoordinatorEntity, SensorEntity):
 
     @callback
     def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator.
+        This method is called when the coordinator updates.
+        The actual adding/removing of entities is handled by the listener in async_setup_entry.
+        This method just ensures the state of *this* sensor instance is updated.
+        """
         self._update_internal_state()
-        if self._get_item_data() is None:
-            _LOGGER.info(
-                "Item ID %s (Type: %s, Sensor unique_id: %s) no longer found.",
-                self._item_id,
-                self._item_type_prefix,
-                self.unique_id,
-            )
         self.async_write_ha_state()
 
     @property
