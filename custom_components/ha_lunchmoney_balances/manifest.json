@@ -5,7 +5,7 @@
   "issue_tracker": "https://github.com/mrlopezco/ha_lunchmoney_balances/issues",
   "codeowners": ["@mrlopezco"],
   "version": "1.0.0",
-  "requirements": ["lunchable==0.1.0"],
+  "requirements": ["lunchable==1.4.2"],
   "config_flow": true,
   "iot_class": "cloud_polling",
   "dependencies": [],
