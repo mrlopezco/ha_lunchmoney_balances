@@ -1,8 +1,9 @@
 """Sensor platform for Lunch Money Balances integration."""
 
 import logging
-from datetime import datetime
+from datetime import datetime, date
 from decimal import Decimal, InvalidOperation
+from typing import Any
 
 from homeassistant.components.sensor import (
     SensorEntity,
@@ -18,6 +19,7 @@ from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
 )
 from homeassistant.const import ATTR_ATTRIBUTION
+from homeassistant.util import dt as dt_util
 
 from .const import (
     DOMAIN,
@@ -50,56 +52,54 @@ async def async_setup_entry(
 
     _LOGGER.debug("Sensor setup: Full coordinator data: %s", coordinator.data)  # DEBUG
 
-    # Ensure coordinator data is structured as expected {"assets": {...}, "user": UserObject or None}
-    if (
-        coordinator.data is None or "assets" not in coordinator.data
-    ):  # User key might be None if API fails for user but not assets
+    if coordinator.data is None or (
+        "manual_assets" not in coordinator.data
+        and "plaid_accounts" not in coordinator.data
+    ):
         _LOGGER.warning(
-            "Sensor setup: Initial data from coordinator is missing or not structured correctly (missing 'assets' key). "
-            "Skipping entity creation. This might be normal if no assets were found initially. Coordinator data: %s",
+            "Sensor setup: Initial data from coordinator is missing or not structured correctly. Coordinator data: %s",
             coordinator.data,
         )
         return
 
-    if coordinator.data.get("user") is None:
-        _LOGGER.warning(
-            "Sensor setup: User data is missing from coordinator. Net worth currency might be affected."
+    entities = []
+    # Create sensors for manual assets
+    manual_assets_dict = coordinator.data.get("manual_assets", {})
+    _LOGGER.debug(
+        "Sensor setup: Manual assets dict from coordinator: %s", manual_assets_dict
+    )
+    for asset_id in manual_assets_dict:
+        _LOGGER.debug(
+            "Sensor setup: Creating LunchMoneyBalanceSensor for manual asset_id: %s",
+            asset_id,
+        )
+        entities.append(
+            LunchMoneyBalanceSensor(coordinator, asset_id, config_entry, is_plaid=False)
         )
 
-    entities = []
-    assets_data_dict = coordinator.data.get(
-        "assets", {}
-    )  # Get the dictionary of assets
-
+    # Create sensors for Plaid accounts
+    plaid_accounts_dict = coordinator.data.get("plaid_accounts", {})
     _LOGGER.debug(
-        "Sensor setup: Assets data dict from coordinator: %s", assets_data_dict
-    )  # DEBUG
-
-    if assets_data_dict:
-        # Iterate through the asset IDs in the "assets" dictionary
-        for asset_id in assets_data_dict:
-            # The actual asset object is assets_data_dict[asset_id]
-            # The LunchMoneyBalanceSensor constructor expects the asset_id and gets data via _get_asset_data
-            _LOGGER.debug(
-                "Sensor setup: Creating LunchMoneyBalanceSensor for asset_id: %s",
-                asset_id,
-            )  # DEBUG
-            entities.append(
-                LunchMoneyBalanceSensor(coordinator, asset_id, config_entry)
+        "Sensor setup: Plaid accounts dict from coordinator: %s", plaid_accounts_dict
+    )
+    for account_id in plaid_accounts_dict:
+        _LOGGER.debug(
+            "Sensor setup: Creating LunchMoneyBalanceSensor for Plaid account_id: %s",
+            account_id,
+        )
+        entities.append(
+            LunchMoneyBalanceSensor(
+                coordinator, account_id, config_entry, is_plaid=True
             )
-    else:
-        _LOGGER.info(
-            "Sensor setup: No assets found in coordinator.data['assets']. No asset sensors will be created."
         )
 
     # Create Net Worth sensor
-    # It can be created even if there are no assets (net worth would be 0)
-    _LOGGER.debug("Sensor setup: Creating LunchMoneyNetWorthSensor.")  # DEBUG
+    _LOGGER.debug("Sensor setup: Creating LunchMoneyNetWorthSensor.")
     entities.append(LunchMoneyNetWorthSensor(coordinator, config_entry))
 
     if entities:
-        _LOGGER.debug("Sensor setup: Adding %s entities.", len(entities))  # DEBUG
-        async_add_entities(entities, True)  # Request immediate update of added entities
+        _LOGGER.debug("Sensor setup: Adding %s entities.", len(entities))
+        async_add_entities(entities, True)
     else:
         _LOGGER.info(
             "Sensor setup: No sensor entities created for Lunch Money Balances."
@@ -107,259 +107,262 @@ async def async_setup_entry(
 
 
 class LunchMoneyBalanceSensor(CoordinatorEntity, SensorEntity):
-    """Representation of a Lunch Money asset balance sensor."""
+    """Representation of a Lunch Money asset or Plaid account balance sensor."""
 
-    _attr_state_class = (
-        SensorStateClass.TOTAL
-    )  # Or MEASUREMENT, TOTAL might be more apt for balance
+    _attr_state_class = SensorStateClass.TOTAL
     _attr_device_class = SensorDeviceClass.MONETARY
     _attr_attribution = ATTRIBUTION
-    # The icon can be set here if it's always the same, or dynamically in properties
-    # _attr_icon = DEFAULT_ICON # Example if you have a single default icon for all balance sensors
 
     def __init__(
         self,
         coordinator: DataUpdateCoordinator,
-        asset_id: int,
+        item_id: int,
         config_entry: ConfigEntry,
+        is_plaid: bool,
     ) -> None:
-        """Initialize the sensor."""
+        """Initialize the sensor for a manual asset or Plaid account."""
         super().__init__(coordinator)
-        self._asset_id = asset_id
+        self._item_id = item_id  # This is asset.id or plaid_account.id
         self._config_entry = config_entry
-        # Initial data fetch and attribute setting are handled by _handle_coordinator_update
-        # called by CoordinatorEntity logic, and also explicitly called once here.
+        self._is_plaid = is_plaid
+        self._item_type_prefix = "plaid" if is_plaid else "manual"
         self._update_internal_state()
 
-    def _get_asset_data(self):
-        """Helper to safely get asset data for the current asset_id from the coordinator."""
-        # Ensure asset_id is not the string "assets" or "user"
-        if not isinstance(self._asset_id, (int, str)) or str(self._asset_id) in [
-            "assets",
-            "user",
-        ]:
-            _LOGGER.error(
-                "Invalid asset_id type or value in _get_asset_data: %s", self._asset_id
-            )
-            return None
+    def _get_item_data(
+        self,
+    ) -> any | None:  # Any can be AssetsObject or PlaidAccountObject
+        """Helper to safely get item data from the coordinator."""
+        data_key = "plaid_accounts" if self._is_plaid else "manual_assets"
         if (
             self.coordinator.data
-            and "assets" in self.coordinator.data
-            and self._asset_id in self.coordinator.data["assets"]
+            and data_key in self.coordinator.data
+            and self._item_id in self.coordinator.data[data_key]
         ):
-            return self.coordinator.data["assets"][self._asset_id]
+            return self.coordinator.data[data_key][self._item_id]
         _LOGGER.debug(
-            "_get_asset_data: Asset ID %s not found in coordinator's assets dict.",
-            self._asset_id,
+            "_get_item_data: Item ID %s (type: %s) not found in coordinator's %s dict.",
+            self._item_id,
+            self._item_type_prefix,
+            data_key,
         )
         return None
 
     def _update_internal_state(self) -> None:
         """Update internal state attributes based on coordinator data."""
-        asset_data = self._get_asset_data()
-        if asset_data:
-            asset_name = getattr(asset_data, "display_name", None) or getattr(
-                asset_data, "name", f"Asset {self._asset_id}"
-            )
-            self._attr_name = f"{asset_name} Balance"  # Sensor name
-            self._attr_unique_id = f"{self._config_entry.entry_id}_{self._asset_id}_balance"  # Unique ID for the sensor entity
+        item_data = self._get_item_data()
 
-            inverted_types = self._config_entry.options.get(
-                CONF_INVERTED_ASSET_TYPES, DEFAULT_INVERTED_ASSET_TYPES
-            )
+        inverted_types_config = self._config_entry.options.get(
+            CONF_INVERTED_ASSET_TYPES, DEFAULT_INVERTED_ASSET_TYPES
+        )
 
-            self._attr_native_value = self._parse_balance(
-                getattr(asset_data, "balance", None)
-            )
+        if item_data:
+            item_name: str
+            raw_balance_val: float | None
+            currency_val: str | None
+            item_type_for_inversion: str  # Used to check against inverted_types_config
+
+            if self._is_plaid:
+                # PlaidAccountObject attributes
+                item_name = getattr(item_data, "name", f"Plaid Account {self._item_id}")
+                # balance is Optional[float], so it can be None
+                raw_balance_val = getattr(item_data, "balance", None)
+                currency_val = getattr(item_data, "currency", None)
+                item_type_for_inversion = getattr(
+                    item_data, "type", ""
+                ).lower()  # Plaid uses 'type'
+            else:
+                # AssetsObject attributes (manual asset)
+                item_name = getattr(item_data, "display_name", None) or getattr(
+                    item_data, "name", f"Asset {self._item_id}"
+                )
+                raw_balance_val = self._parse_balance(
+                    getattr(item_data, "balance", None)
+                )  # Manual balance is string
+                currency_val = getattr(item_data, "currency", None)
+                item_type_for_inversion = getattr(
+                    item_data, "type_name", ""
+                ).lower()  # Manual uses 'type_name'
+
+            self._attr_name = f"{item_name} Balance"
+            self._attr_unique_id = f"{self._config_entry.entry_id}_{self._item_type_prefix}_{self._item_id}_balance"
+
+            if (
+                raw_balance_val is not None
+                and item_type_for_inversion in inverted_types_config
+            ):
+                self._attr_native_value = -raw_balance_val
+            else:
+                self._attr_native_value = raw_balance_val
+
             self._attr_native_unit_of_measurement = (
-                getattr(asset_data, "currency", None).upper()
-                if getattr(asset_data, "currency", None)
-                else None
+                currency_val.upper() if currency_val else None
             )
 
-            # Dynamic icon based on asset type (optional example)
-            type_name = getattr(asset_data, "type_name", "").lower()
-            if "cash" in type_name:
+            # Icon logic (can be expanded for Plaid specific types if needed)
+            icon_type_source = (
+                item_type_for_inversion  # Use the already determined type
+            )
+            if "cash" in icon_type_source or "depository" in icon_type_source:
                 self._attr_icon = "mdi:cash"
-            elif "credit" in type_name:
+            elif "credit" in icon_type_source:
                 self._attr_icon = "mdi:credit-card"
-            elif "investment" in type_name:
+            elif "investment" in icon_type_source or "brokerage" in icon_type_source:
                 self._attr_icon = "mdi:chart-line"
-            elif "loan" in type_name:
+            elif "loan" in icon_type_source:
                 self._attr_icon = "mdi:bank-transfer-out"
             else:
-                self._attr_icon = DEFAULT_ICON  # Fallback to default icon
-
-            if self._attr_native_value is not None and type_name in inverted_types:
-                self._attr_native_value = -self._attr_native_value
-
-        else:  # Asset data not found
-            self._attr_name = (
-                f"Lunch Money Asset {self._asset_id} Balance (Data Missing)"
-            )
-            self._attr_unique_id = (
-                f"{self._config_entry.entry_id}_{self._asset_id}_balance"
-            )
+                self._attr_icon = DEFAULT_ICON
+        else:
+            self._attr_name = f"Lunch Money Item {self._item_type_prefix} {self._item_id} Balance (Data Missing)"
+            self._attr_unique_id = f"{self._config_entry.entry_id}_{self._item_type_prefix}_{self._item_id}_balance"
             self._attr_native_value = None
             self._attr_native_unit_of_measurement = None
-            self._attr_icon = "mdi:alert-circle-outline"  # Icon indicating an issue
+            self._attr_icon = "mdi:alert-circle-outline"
 
     def _parse_balance(self, balance_str: str | None) -> float | None:
-        """Safely parse the balance string to a float."""
+        """Safely parse the balance string (from manual assets) to a float."""
         if balance_str is None:
             return None
         try:
-            # Using Decimal for precision before converting to float for HA state
             return float(Decimal(balance_str))
         except (InvalidOperation, ValueError, TypeError):
             _LOGGER.error(
-                "Could not parse balance '%s' for asset %s", balance_str, self._asset_id
+                "Could not parse balance string '%s' for item %s",
+                balance_str,
+                self._item_id,
             )
             return None
 
     @property
     def available(self) -> bool:
-        """Return True if entity is available (i.e., data is present in coordinator for this asset)."""
-        return super().available and self._get_asset_data() is not None
+        return super().available and self._get_item_data() is not None
 
     @property
     def device_info(self) -> DeviceInfo | None:
-        """Return information to link this entity with a device (representing the asset)."""
-        asset_data = self._get_asset_data()
-        if not asset_data:
-            # This can happen if data for this specific asset_id is missing
-            _LOGGER.debug("Device Info: No asset_data for asset_id %s", self._asset_id)
+        item_data = self._get_item_data()
+        if not item_data:
             return None
 
-        # Use the config entry ID as part of the asset's device identifier for uniqueness across HA instances
-        # if multiple integrations of the same type were ever allowed.
-        # The primary identifier for the asset device is its own asset_id.
-        asset_device_identifier = str(self._asset_id)
-        asset_name = getattr(asset_data, "display_name", None) or getattr(
-            asset_data, "name", f"Asset {asset_device_identifier}"
-        )
+        device_identifier_suffix = f"{self._item_type_prefix}_{self._item_id}"
+        device_name: str
+        model_type: str
+
+        if self._is_plaid:
+            device_name = getattr(item_data, "name", f"Plaid Account {self._item_id}")
+            model_type = getattr(item_data, "type", "N/A")  # Plaid uses 'type'
+        else:
+            device_name = getattr(item_data, "display_name", None) or getattr(
+                item_data, "name", f"Asset {self._item_id}"
+            )
+            model_type = getattr(
+                item_data, "type_name", "N/A"
+            )  # Manual uses 'type_name'
 
         _LOGGER.debug(
-            "Device Info for Asset ID %s: Name: %s", asset_device_identifier, asset_name
+            "Device Info for Item ID %s (Type: %s): Name: %s",
+            self._item_id,
+            self._item_type_prefix,
+            device_name,
         )
 
         return DeviceInfo(
-            identifiers={
-                (DOMAIN, asset_device_identifier)
-            },  # Device unique to this asset
-            name=asset_name,
+            identifiers={(DOMAIN, device_identifier_suffix)},
+            name=device_name,
             manufacturer="Lunch Money",
-            model=f"Asset ({getattr(asset_data, 'type_name', 'N/A')})",
-            configuration_url="https://my.lunchmoney.app/assets",
-            via_device=(
-                DOMAIN,
-                self._config_entry.entry_id,
-            ),  # Links to the main integration device
+            model=f"{('Plaid Account' if self._is_plaid else 'Manual Asset')} ({model_type})",
+            configuration_url="https://my.lunchmoney.app/"
+            + ("plaid" if self._is_plaid else "assets"),
+            via_device=(DOMAIN, self._config_entry.entry_id),
         )
 
     @property
     def extra_state_attributes(self) -> dict | None:
-        """Return the state attributes."""
-        asset_data = self._get_asset_data()
-        if not asset_data:
+        item_data = self._get_item_data()
+        if not item_data:
             return None
 
         attrs = {
-            ATTR_ASSET_ID: self._asset_id,  # Already an int
+            ATTR_ASSET_ID: self._item_id,  # This is the LunchMoney internal ID for the asset/plaid_account
+            "item_source": "plaid" if self._is_plaid else "manual",
         }
 
-        # Helper to add attribute if present in asset_data
-        def add_attr_if_present(
-            attr_key_const, data_key_on_asset_obj, is_numeric=False, is_date=False
-        ):
-            value = getattr(asset_data, data_key_on_asset_obj, None)
-            if value is not None:
-                if is_numeric:
-                    try:
-                        attrs[attr_key_const] = float(Decimal(str(value)))
-                    except (InvalidOperation, ValueError, TypeError):
-                        _LOGGER.debug(
-                            "Could not parse numeric attribute %s: %s",
-                            data_key_on_asset_obj,
-                            value,
-                        )
-                        attrs[attr_key_const] = (
-                            value  # Store as string if parsing fails
-                        )
-                elif is_date:
-                    try:
-                        # Ensure balance_as_of is a valid ISO 8601 string before parsing
-                        # The lunchable library might already parse this to a datetime object
-                        if isinstance(value, datetime):
-                            attrs[attr_key_const] = value.isoformat()
-                        elif isinstance(value, str):  # If it's a string from API
-                            parsed_date = datetime.fromisoformat(
-                                value.replace("Z", "+00:00")
-                            )
-                            attrs[attr_key_const] = parsed_date.isoformat()
-                        else:
-                            attrs[attr_key_const] = str(value)
-                    except (ValueError, TypeError):
-                        _LOGGER.warning(
-                            "Could not parse date attribute %s: %s",
-                            data_key_on_asset_obj,
-                            value,
-                        )
-                        attrs[attr_key_const] = value  # Store as is if parsing fails
-                else:
-                    attrs[attr_key_const] = value
+        # Adapt attribute fetching based on item_data type (Plaid or Manual)
+        if self._is_plaid:
+            attrs["plaid_account_type"] = getattr(item_data, "type", None)
+            attrs["plaid_account_subtype"] = getattr(item_data, "subtype", None)
+            attrs["institution_name"] = getattr(item_data, "institution_name", None)
+            attrs["plaid_mask"] = getattr(item_data, "mask", None)
+            attrs["plaid_status"] = getattr(item_data, "status", None)
+            balance_as_of_val = getattr(
+                item_data, "balance_last_update", None
+            )  # datetime object
+        else:  # Manual Asset
+            attrs["asset_type_name"] = getattr(item_data, "type_name", None)
+            attrs["asset_subtype_name"] = getattr(item_data, "subtype_name", None)
+            attrs["institution_name"] = getattr(item_data, "institution_name", None)
+            # Manual 'to_base' is important if it exists
+            to_base_val = getattr(item_data, "to_base", None)
+            if to_base_val is not None:
+                try:
+                    attrs["to_base_currency_value"] = float(Decimal(str(to_base_val)))
+                except:
+                    attrs["to_base_currency_value"] = to_base_val
+            balance_as_of_val = getattr(
+                item_data, "balance_as_of", None
+            )  # str or datetime
 
-        add_attr_if_present(ATTR_TYPE_NAME, "type_name")
-        add_attr_if_present(ATTR_SUBTYPE_NAME, "subtype_name")
-        add_attr_if_present(ATTR_INSTITUTION_NAME, "institution_name")
-        add_attr_if_present(
-            ATTR_DISPLAY_NAME, "display_name"
-        )  # Assuming 'display_name' is an attribute on lunchable's asset object
-        add_attr_if_present(
-            ATTR_TO_BASE_CURRENCY, "to_base", is_numeric=True
-        )  # API uses 'to_base'
-        add_attr_if_present(ATTR_BALANCE_AS_OF, "balance_as_of", is_date=True)
+        # Common formatting for balance_as_of
+        if balance_as_of_val:
+            if isinstance(balance_as_of_val, datetime):
+                attrs["balance_as_of"] = balance_as_of_val.isoformat()
+            elif isinstance(balance_as_of_val, str):
+                try:
+                    attrs["balance_as_of"] = datetime.fromisoformat(
+                        balance_as_of_val.replace("Z", "+00:00")
+                    ).isoformat()
+                except ValueError:
+                    attrs["balance_as_of"] = balance_as_of_val
+            elif isinstance(balance_as_of_val, date):  # Plaid date_linked might be date
+                attrs["balance_as_of"] = balance_as_of_val.isoformat()
 
-        # Add original name from API if display_name was used for the entity name and they differ
-        original_name = getattr(asset_data, "name", None)
-        display_name_val = getattr(asset_data, "display_name", None)
-        if display_name_val and original_name and display_name_val != original_name:
-            attrs["asset_original_name"] = original_name
-        elif (
-            not display_name_val and original_name
-        ):  # If display_name is missing, but name is there
-            attrs["asset_original_name"] = original_name
-
-        # Add currency code from native_unit_of_measurement if available
         if self.native_unit_of_measurement:
             attrs["currency_code"] = self.native_unit_of_measurement
 
-        # Add whether this balance was inverted
-        inverted_types = self._config_entry.options.get(
+        inverted_types_config = self._config_entry.options.get(
             CONF_INVERTED_ASSET_TYPES, DEFAULT_INVERTED_ASSET_TYPES
         )
-        asset_type = getattr(asset_data, "type_name", "").lower()
-        attrs["balance_inverted"] = asset_type in inverted_types
+        item_type_for_inversion = getattr(
+            item_data, "type" if self._is_plaid else "type_name", ""
+        ).lower()
+        attrs["balance_inverted"] = item_type_for_inversion in inverted_types_config
+
+        # Add original name for manual assets if display_name was used
+        if not self._is_plaid:
+            original_name = getattr(item_data, "name", None)
+            display_name_val = getattr(item_data, "display_name", None)
+            if display_name_val and original_name and display_name_val != original_name:
+                attrs["asset_original_name"] = original_name
+            elif not display_name_val and original_name:
+                attrs["asset_original_name"] = original_name
+        elif self._is_plaid:  # For Plaid, name is the primary identifier
+            attrs["plaid_account_name"] = getattr(item_data, "name", None)
 
         return attrs
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        """Handle updated data from the coordinator."""
-        self._update_internal_state()  # Update all internal attributes based on new data
-        if self._get_asset_data() is None:
+        self._update_internal_state()
+        if self._get_item_data() is None:
             _LOGGER.info(
-                "Asset ID %s (Sensor: %s unique_id: %s) no longer found in Lunch Money data. Entity will become unavailable.",
-                self._asset_id,
-                self.entity_id,
+                "Item ID %s (Type: %s, Sensor unique_id: %s) no longer found.",
+                self._item_id,
+                self._item_type_prefix,
                 self.unique_id,
             )
-            # The entity will become unavailable due to the `available` property check
-        self.async_write_ha_state()  # Inform HA of state change
+        self.async_write_ha_state()
 
     @property
     def entity_registry_enabled_default(self) -> bool:
-        """Return if the entity should be enabled when first added to the entity registry."""
         return True
 
 
@@ -392,75 +395,107 @@ class LunchMoneyNetWorthSensor(CoordinatorEntity, SensorEntity):
             return self.coordinator.data["user"]
         return None
 
-    def _get_all_asset_data(self) -> dict:
-        """Helper to safely get all asset data from the coordinator."""
-        if self.coordinator.data and "assets" in self.coordinator.data:
-            return self.coordinator.data["assets"]
+    def _get_manual_asset_data(self) -> dict:
+        if self.coordinator.data and "manual_assets" in self.coordinator.data:
+            return self.coordinator.data["manual_assets"]
+        return {}
+
+    def _get_plaid_account_data(self) -> dict:
+        if self.coordinator.data and "plaid_accounts" in self.coordinator.data:
+            return self.coordinator.data["plaid_accounts"]
         return {}
 
     def _update_internal_state(self) -> None:
-        """Update the sensor's state."""
-        all_assets = self._get_all_asset_data()
+        """Update the sensor's state, summing from manual and Plaid accounts."""
+        manual_assets = self._get_manual_asset_data()
+        plaid_accounts = self._get_plaid_account_data()
         user_data = self._get_user_data()
 
-        inverted_types = self._config_entry.options.get(
+        inverted_types_config = self._config_entry.options.get(
             CONF_INVERTED_ASSET_TYPES, DEFAULT_INVERTED_ASSET_TYPES
         )
 
-        total_net_worth = Decimal("0.0")  # Use Decimal for precision
+        total_net_worth = Decimal("0.0")
+        user_primary_currency = getattr(user_data, "currency", None)
+        if user_primary_currency:
+            user_primary_currency = user_primary_currency.lower()
 
-        if all_assets:
-            for asset_data in all_assets.values():
-                if not hasattr(asset_data, "to_base") or asset_data.to_base is None:
-                    _LOGGER.debug(
-                        "Asset %s (%s) missing 'to_base' value, skipping for net worth.",
-                        getattr(asset_data, "id", "N/A"),
-                        getattr(asset_data, "name", "N/A"),
-                    )
-                    continue
+        # Sum from manual assets (using 'to_base')
+        for asset_data in manual_assets.values():
+            if not hasattr(asset_data, "to_base") or asset_data.to_base is None:
+                _LOGGER.debug(
+                    "Manual Asset %s (%s) missing 'to_base', skipping for net worth.",
+                    getattr(asset_data, "id", "N/A"),
+                    getattr(asset_data, "name", "N/A"),
+                )
+                continue
+            try:
+                base_value = Decimal(
+                    str(asset_data.to_base)
+                )  # 'to_base' is already in user's primary currency
+                asset_type = getattr(asset_data, "type_name", "").lower()
+                if asset_type in inverted_types_config:
+                    total_net_worth -= base_value
+                else:
+                    total_net_worth += base_value
+            except (InvalidOperation, ValueError, TypeError) as e:
+                _LOGGER.error(
+                    "Error processing to_base for manual asset %s for net worth: %s",
+                    getattr(asset_data, "id", "N/A"),
+                    e,
+                )
 
+        # Sum from Plaid accounts
+        for plaid_account_data in plaid_accounts.values():
+            plaid_balance = getattr(
+                plaid_account_data, "balance", None
+            )  # Already a float or None
+            plaid_currency = getattr(plaid_account_data, "currency", None)
+
+            if plaid_balance is None or plaid_currency is None:
+                _LOGGER.debug(
+                    "Plaid Account %s (%s) missing balance or currency, skipping for net worth.",
+                    getattr(plaid_account_data, "id", "N/A"),
+                    getattr(plaid_account_data, "name", "N/A"),
+                )
+                continue
+
+            # CRITICAL: Only include Plaid accounts if their currency matches the user's primary currency.
+            # Otherwise, we cannot accurately sum them without exchange rates.
+            if (
+                user_primary_currency
+                and plaid_currency.lower() == user_primary_currency
+            ):
                 try:
-                    # Ensure to_base is treated as a string for Decimal conversion if it's float/int
-                    base_value = Decimal(str(asset_data.to_base))
-                    asset_type = getattr(asset_data, "type_name", "").lower()
-
-                    if asset_type in inverted_types:
-                        total_net_worth -= base_value
+                    balance_value = Decimal(
+                        str(plaid_balance)
+                    )  # Plaid balance is float
+                    account_type = getattr(
+                        plaid_account_data, "type", ""
+                    ).lower()  # Plaid uses 'type'
+                    if account_type in inverted_types_config:
+                        total_net_worth -= balance_value
                     else:
-                        total_net_worth += base_value
+                        total_net_worth += balance_value
                 except (InvalidOperation, ValueError, TypeError) as e:
                     _LOGGER.error(
-                        "Error processing to_base value '%s' for asset %s for net worth: %s",
-                        asset_data.to_base,
-                        getattr(asset_data, "id", "N/A"),
+                        "Error processing balance for Plaid account %s for net worth: %s",
+                        getattr(plaid_account_data, "id", "N/A"),
                         e,
                     )
+            else:
+                _LOGGER.warning(
+                    "Plaid Account %s (%s) has currency %s which does not match user's primary currency %s. Excluding from net worth.",
+                    getattr(plaid_account_data, "id", "N/A"),
+                    getattr(plaid_account_data, "name", "N/A"),
+                    plaid_currency,
+                    user_primary_currency.upper() if user_primary_currency else "N/A",
+                )
 
-        self._attr_native_value = float(
-            total_net_worth
-        )  # Convert to float for HA state
-
-        if user_data and hasattr(user_data, "currency") and user_data.currency:
-            self._attr_native_unit_of_measurement = user_data.currency.upper()
-        else:
-            # Try to infer from first asset with a 'to_base' and 'currency' if user_data is missing currency
-            # This is a fallback, primary should be user_data.currency
-            self._attr_native_unit_of_measurement = (
-                None  # Default to None if not determinable
-            )
-            if all_assets:
-                for asset_data in all_assets.values():
-                    if (
-                        hasattr(asset_data, "to_base")
-                        and asset_data.to_base is not None
-                        and hasattr(asset_data, "currency")
-                        and asset_data.currency
-                    ):
-                        # This assumes the 'currency' of an asset might reflect the base currency,
-                        # which is not strictly true. user_data.currency is the correct source.
-                        # self._attr_native_unit_of_measurement = asset_data.currency.upper()
-                        # break
-                        pass  # Keep it None, rely on user_data.currency only
+        self._attr_native_value = float(total_net_worth)
+        self._attr_native_unit_of_measurement = (
+            user_primary_currency.upper() if user_primary_currency else None
+        )
 
     @property
     def available(self) -> bool:
@@ -471,7 +506,7 @@ class LunchMoneyNetWorthSensor(CoordinatorEntity, SensorEntity):
         return (
             super().available
             and self.coordinator.data is not None
-            and "user" in self.coordinator.data
+            and "user" in self.coordinator.data  # User data is crucial for currency
         )
 
     @property
@@ -482,13 +517,10 @@ class LunchMoneyNetWorthSensor(CoordinatorEntity, SensorEntity):
             self._config_entry.entry_id,
         )
         return DeviceInfo(
-            identifiers={
-                (DOMAIN, self._config_entry.entry_id)
-            },  # This IS the main integration device
-            name=NET_WORTH_DEVICE_NAME,  # For example, "Lunch Money Balances" or use config_entry.title
+            identifiers={(DOMAIN, f"{self._config_entry.entry_id}_summary")},
+            name=NET_WORTH_DEVICE_NAME,
             manufacturer="Lunch Money",
-            model="Account Summary Integration",  # Differentiate from individual asset model
-            # Add entry_type if available and relevant, e.g., config_entry.source
+            model="Account Summary Integration",
         )
 
     @callback

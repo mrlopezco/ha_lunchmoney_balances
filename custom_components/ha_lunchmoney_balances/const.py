@@ -18,22 +18,30 @@ UPDATE_INTERVAL_OPTIONS = {
     1440: "Daily (every 24 hours)",
 }
 
-# Asset types - used for configuration. Add more if Lunch Money has more.
-# These should ideally match the 'type_name' values from the API.
-# From your sample: "cash", "credit", "vehicle", "loan", "real estate", "investment", "employee compensation"
+# Asset types - used for configuration.
+# These should cover 'type_name' from manual assets and 'type' from Plaid accounts.
+# Example Plaid types: "depository" (checking/savings), "credit card", "loan", "investment", "brokerage"
+# The 'type' field from PlaidAccountObject is just 'type', not 'type_name'.
 POSSIBLE_ASSET_TYPES = sorted(
-    [
-        "cash",
-        "credit",
-        "loan",
-        "investment",
-        "real estate",
-        "vehicle",
-        "employee compensation",
-        "other assets",  # General categories if API uses them
-        "other liabilities",
-    ]
+    list(
+        set(
+            [  # Use set to avoid duplicates
+                "cash",
+                "credit",  # Covers Plaid "credit card" if mapped
+                "loan",
+                "investment",  # Covers Plaid "investment", "brokerage"
+                "real estate",
+                "vehicle",
+                "employee compensation",
+                "depository",  # From Plaid (checking, savings)
+                "brokerage",  # From Plaid
+                "other",  # General fallback from Plaid or manual
+                # Add any other distinct types you see from Plaid or manual assets
+            ]
+        )
+    )
 )
+
 
 # Attributes for the Lunch Money sensors
 ATTR_ASSET_ID = "asset_id"

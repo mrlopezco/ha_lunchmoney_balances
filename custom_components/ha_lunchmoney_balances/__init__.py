@@ -22,43 +22,73 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     lunch_money_api = LunchMoney(access_token=api_key)
 
     async def async_update_data():
-        """Fetch data from Lunch Money API, including assets and user info."""
+        """Fetch data from Lunch Money API, including assets, Plaid accounts, and user info."""
         try:
-            assets_list = await hass.async_add_executor_job(lunch_money_api.get_assets)
+            manual_assets_list = await hass.async_add_executor_job(
+                lunch_money_api.get_assets
+            )
+            plaid_accounts_list = await hass.async_add_executor_job(
+                lunch_money_api.get_plaid_accounts
+            )
+            user_object = await hass.async_add_executor_job(lunch_money_api.get_user)
 
-            _LOGGER.debug("Fetched Lunch Money assets list: %s", assets_list)
+            _LOGGER.debug(
+                "Fetched Lunch Money manual assets list: %s", manual_assets_list
+            )
+            _LOGGER.debug(
+                "Fetched Lunch Money Plaid accounts list: %s", plaid_accounts_list
+            )
+            _LOGGER.debug("Fetched Lunch Money user object: %s", user_object)
 
-            processed_data = {"assets": {}, "user": None}
+            processed_data = {"manual_assets": {}, "plaid_accounts": {}, "user": None}
 
-            if assets_list and isinstance(assets_list, list):
-                _LOGGER.debug("Assets list found with %s items.", len(assets_list))
-                valid_assets = [asset for asset in assets_list if hasattr(asset, "id")]
+            if user_object:
+                processed_data["user"] = user_object
 
-                if not valid_assets:
+            if manual_assets_list and isinstance(manual_assets_list, list):
+                _LOGGER.debug(
+                    "Manual assets list found with %s items.", len(manual_assets_list)
+                )
+                valid_manual_assets = [
+                    asset for asset in manual_assets_list if hasattr(asset, "id")
+                ]
+                if not valid_manual_assets:
                     _LOGGER.warning(
-                        "The fetched assets list was empty after filtering or did not contain asset objects with an 'id'."
+                        "Manual assets list was empty after filtering for 'id'."
                     )
                 else:
-                    processed_data["assets"] = {
-                        asset.id: asset for asset in valid_assets
+                    processed_data["manual_assets"] = {
+                        asset.id: asset for asset in valid_manual_assets
                     }
             else:
                 _LOGGER.warning(
-                    "No assets list found in API response, or the response was not a list. Fetched data: %s",
-                    assets_list,
+                    "No manual assets list found or response was not a list. Fetched: %s",
+                    manual_assets_list,
                 )
 
-            _LOGGER.debug("Final processed_data for coordinator: %s", processed_data)
-            if "assets" in processed_data:
+            if plaid_accounts_list and isinstance(plaid_accounts_list, list):
                 _LOGGER.debug(
-                    "Processed assets keys: %s", processed_data["assets"].keys()
+                    "Plaid accounts list found with %s items.", len(plaid_accounts_list)
                 )
-            if "user" in processed_data and processed_data["user"]:
-                _LOGGER.debug(
-                    "Processed user currency: %s",
-                    getattr(processed_data["user"], "currency", "N/A"),
+                processed_data["plaid_accounts"] = {
+                    account.id: account for account in plaid_accounts_list
+                }
+            else:
+                _LOGGER.warning(
+                    "No Plaid accounts list found or response was not a list. Fetched: %s",
+                    plaid_accounts_list,
                 )
 
+            _LOGGER.debug(
+                "Final processed_data for coordinator: manual_assets keys: %s, plaid_accounts keys: %s, user currency: %s",
+                list(processed_data["manual_assets"].keys()),
+                list(processed_data["plaid_accounts"].keys()),
+                (
+                    getattr(processed_data["user"], "currency", "N/A")
+                    if processed_data["user"]
+                    else "N/A"
+                ),
+            )
             return processed_data
 
         except Exception as err:
@@ -71,7 +101,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = DataUpdateCoordinator(
         hass,
         _LOGGER,
-        name="Lunch Money Balances Data",  # More generic name for the coordinator
+        name="Lunch Money Balances Data",
         update_method=async_update_data,
         update_interval=timedelta(minutes=update_interval_minutes),
     )
