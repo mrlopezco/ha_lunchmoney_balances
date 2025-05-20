@@ -48,6 +48,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     assets_list,
                 )
 
+            _LOGGER.debug("Final processed_data for coordinator: %s", processed_data)
+            if "assets" in processed_data:
+                _LOGGER.debug(
+                    "Processed assets keys: %s", processed_data["assets"].keys()
+                )
+            if "user" in processed_data and processed_data["user"]:
+                _LOGGER.debug(
+                    "Processed user currency: %s",
+                    getattr(processed_data["user"], "currency", "N/A"),
+                )
+
             return processed_data
 
         except Exception as err:

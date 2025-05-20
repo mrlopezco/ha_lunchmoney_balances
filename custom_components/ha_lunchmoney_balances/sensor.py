@@ -48,33 +48,61 @@ async def async_setup_entry(
     """Set up the Lunch Money Balance sensor platform."""
     coordinator: DataUpdateCoordinator = hass.data[DOMAIN][config_entry.entry_id]
 
-    if coordinator.data is None:
+    _LOGGER.debug("Sensor setup: Full coordinator data: %s", coordinator.data)  # DEBUG
+
+    # Ensure coordinator data is structured as expected {"assets": {...}, "user": UserObject or None}
+    if (
+        coordinator.data is None or "assets" not in coordinator.data
+    ):  # User key might be None if API fails for user but not assets
         _LOGGER.warning(
-            "No data received from coordinator during sensor setup. Skipping entity creation. This might be normal if no assets were found initially."
+            "Sensor setup: Initial data from coordinator is missing or not structured correctly (missing 'assets' key). "
+            "Skipping entity creation. This might be normal if no assets were found initially. Coordinator data: %s",
+            coordinator.data,
         )
         return
 
+    if coordinator.data.get("user") is None:
+        _LOGGER.warning(
+            "Sensor setup: User data is missing from coordinator. Net worth currency might be affected."
+        )
+
     entities = []
-    for asset_id, asset_data in coordinator.data.items():
-        if asset_data:  # Ensure asset_data is not None
+    assets_data_dict = coordinator.data.get(
+        "assets", {}
+    )  # Get the dictionary of assets
+
+    _LOGGER.debug(
+        "Sensor setup: Assets data dict from coordinator: %s", assets_data_dict
+    )  # DEBUG
+
+    if assets_data_dict:
+        # Iterate through the asset IDs in the "assets" dictionary
+        for asset_id in assets_data_dict:
+            # The actual asset object is assets_data_dict[asset_id]
+            # The LunchMoneyBalanceSensor constructor expects the asset_id and gets data via _get_asset_data
+            _LOGGER.debug(
+                "Sensor setup: Creating LunchMoneyBalanceSensor for asset_id: %s",
+                asset_id,
+            )  # DEBUG
             entities.append(
                 LunchMoneyBalanceSensor(coordinator, asset_id, config_entry)
             )
-        else:
-            _LOGGER.warning(
-                "Asset data for ID %s is missing or invalid, skipping sensor creation.",
-                asset_id,
-            )
+    else:
+        _LOGGER.info(
+            "Sensor setup: No assets found in coordinator.data['assets']. No asset sensors will be created."
+        )
 
     # Create Net Worth sensor
     # It can be created even if there are no assets (net worth would be 0)
+    _LOGGER.debug("Sensor setup: Creating LunchMoneyNetWorthSensor.")  # DEBUG
     entities.append(LunchMoneyNetWorthSensor(coordinator, config_entry))
 
     if entities:
-        async_add_entities(entities, True)
+        _LOGGER.debug("Sensor setup: Adding %s entities.", len(entities))  # DEBUG
+        async_add_entities(entities, True)  # Request immediate update of added entities
     else:
         _LOGGER.info(
-            "No sensor entities created for Lunch Money Balances. This is expected if no assets were found."
+            "Sensor setup: No sensor entities created for Lunch Money Balances."
         )
 
 
@@ -105,8 +133,25 @@ class LunchMoneyBalanceSensor(CoordinatorEntity, SensorEntity):
 
     def _get_asset_data(self):
         """Helper to safely get asset data for the current asset_id from the coordinator."""
-        if self.coordinator.data and self._asset_id in self.coordinator.data:
-            return self.coordinator.data[self._asset_id]
+        # Ensure asset_id is not the string "assets" or "user"
+        if not isinstance(self._asset_id, (int, str)) or str(self._asset_id) in [
+            "assets",
+            "user",
+        ]:
+            _LOGGER.error(
+                "Invalid asset_id type or value in _get_asset_data: %s", self._asset_id
+            )
+            return None
+        if (
+            self.coordinator.data
+            and "assets" in self.coordinator.data
+            and self._asset_id in self.coordinator.data["assets"]
+        ):
+            return self.coordinator.data["assets"][self._asset_id]
+        _LOGGER.debug(
+            "_get_asset_data: Asset ID %s not found in coordinator's assets dict.",
+            self._asset_id,
+        )
         return None
 
     def _update_internal_state(self) -> None:
@@ -179,30 +224,37 @@ class LunchMoneyBalanceSensor(CoordinatorEntity, SensorEntity):
 
     @property
     def device_info(self) -> DeviceInfo | None:
-        """Return information to link this entity with a device."""
+        """Return information to link this entity with a device (representing the asset)."""
         asset_data = self._get_asset_data()
         if not asset_data:
-            return None  # Should not happen if entity is available
+            # This can happen if data for this specific asset_id is missing
+            _LOGGER.debug("Device Info: No asset_data for asset_id %s", self._asset_id)
+            return None
 
+        # Use the config entry ID as part of the asset's device identifier for uniqueness across HA instances
+        # if multiple integrations of the same type were ever allowed.
+        # The primary identifier for the asset device is its own asset_id.
+        asset_device_identifier = str(self._asset_id)
         asset_name = getattr(asset_data, "display_name", None) or getattr(
-            asset_data, "name", f"Unknown Asset {self._asset_id}"
+            asset_data, "name", f"Asset {asset_device_identifier}"
         )
-        asset_type = getattr(asset_data, "type_name", "Unknown Type")
-        institution = getattr(asset_data, "institution_name", "N/A")
+
+        _LOGGER.debug(
+            "Device Info for Asset ID %s: Name: %s", asset_device_identifier, asset_name
+        )
 
         return DeviceInfo(
             identifiers={
-                (DOMAIN, str(self._asset_id))
-            },  # Use str(self._asset_id) for robustness
-            name=asset_name,  # Device name
+                (DOMAIN, asset_device_identifier)
+            },  # Device unique to this asset
+            name=asset_name,
             manufacturer="Lunch Money",
-            model=f"Asset ({asset_type})",
-            configuration_url="https://my.lunchmoney.app/assets",  # Generic link to assets page
+            model=f"Asset ({getattr(asset_data, 'type_name', 'N/A')})",
+            configuration_url="https://my.lunchmoney.app/assets",
             via_device=(
                 DOMAIN,
                 self._config_entry.entry_id,
-            ),  # Link to config entry device
-            # You could add sw_version if lunchable exposes API version or similar
+            ),  # Links to the main integration device
         )
 
     @property
@@ -424,18 +476,19 @@ class LunchMoneyNetWorthSensor(CoordinatorEntity, SensorEntity):
 
     @property
     def device_info(self) -> DeviceInfo:
-        """Return information for the Net Worth device."""
+        """Return information for the Net Worth device. This device acts as the main integration device."""
+        _LOGGER.debug(
+            "Device Info for Net Worth Sensor (Main Integration Device): Entry ID %s",
+            self._config_entry.entry_id,
+        )
         return DeviceInfo(
             identifiers={
-                (DOMAIN, f"{self._config_entry.entry_id}_summary")
-            },  # Unique ID for this summary device
-            name=NET_WORTH_DEVICE_NAME,
+                (DOMAIN, self._config_entry.entry_id)
+            },  # This IS the main integration device
+            name=NET_WORTH_DEVICE_NAME,  # For example, "Lunch Money Balances" or use config_entry.title
             manufacturer="Lunch Money",
-            model="Account Summary",
-            via_device=(
-                DOMAIN,
-                self._config_entry.entry_id,
-            ),  # Links it to the main config entry device
+            model="Account Summary Integration",  # Differentiate from individual asset model
+            # Add entry_type if available and relevant, e.g., config_entry.source
         )
 
     @callback
