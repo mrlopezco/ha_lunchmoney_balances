@@ -141,36 +141,19 @@ class LunchMoneyBalanceOptionsFlowHandler(config_entries.OptionsFlow):
 
     def __init__(self, config_entry: config_entries.ConfigEntry):
         """Initialize options flow."""
-            if AwesomeVersion(HAVERSION) < "2024.11.99":
-                self.config_entry = config_entry
+        self.config_entry = config_entry
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
         """Manage the options."""
         if user_input is not None:
-            # Combine new options with existing data, then create new entry with updated data
-            # This effectively updates the config entry's options.
-            updated_data = {**self.config_entry.data, **user_input}
-            # Home Assistant will automatically update the entry if the title matches.
-            # For options, it's often better to just update the options directly.
-            # However, the original prompt implied storing interval in entry.data.
-            # If it should be in options, the approach is slightly different.
-            # For this case, we're creating a new entry to replace the old one,
-            # which is a common pattern if data is changing.
-            # A more direct options update would be:
-            # return self.async_create_entry(title="", data=user_input)
-            # which merges user_input into config_entry.options
-            # For now, sticking to the user's pattern of storing in data.
+            # Logic to update config_entry and return
             self.hass.config_entries.async_update_entry(
-                self.config_entry, data=updated_data
+                self.config_entry, data={**self.config_entry.data, **user_input}
             )
-            return self.async_create_entry(title="", data={})  # Signal success
+            return self.async_create_entry(title="", data={})
 
-        # Get current values for defaults
-        current_api_key = self.config_entry.data.get(
-            CONF_API_KEY
-        )  # Should not be changed here, but good to have if needed
         current_update_interval = self.config_entry.data.get(
             CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL
         )
