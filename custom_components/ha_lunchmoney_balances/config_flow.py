@@ -9,8 +9,10 @@ from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.aiohttp_client import (
     async_get_clientsession,
 )  # Import for API calls
-from lunchable import LunchMoney
-from lunchable.models import LunchMoneyAPIError  # More specific import for API Error
+from lunchable import (
+    LunchMoney,
+    LunchMoneyAPIError,
+)  # Corrected import for LunchMoneyAPIError
 
 from .const import (
     DOMAIN,
