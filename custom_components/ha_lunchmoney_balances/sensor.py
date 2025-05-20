@@ -1,3 +1,4 @@
+# File: custom_components/ha_lunchmoney_balances/sensor.py
 """Sensor platform for Lunch Money Balances integration."""
 
 import logging
@@ -36,6 +37,7 @@ from .const import (
     NET_WORTH_SENSOR_ID_SUFFIX,
     NET_WORTH_DEVICE_NAME,
     PLATFORMS,
+    CONF_PRIMARY_CURRENCY,  # Import new constant
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -139,7 +141,9 @@ async def async_setup_entry(
                 )
                 entities_to_add.append(new_sensor)
                 active_balance_sensors[unique_id] = new_sensor
-            elif is_zero_balance and unique_id in active_balance_sensors:
+            elif (
+                is_zero_balance and unique_id in active_balance_sensors
+            ):  # Corrected from active_sensors
                 # Balance is zero and sensor exists, so mark for removal
                 _LOGGER.debug(
                     "Marking LunchMoneyBalanceSensor for manual asset_id: %s for removal (balance: %s)",
@@ -179,7 +183,9 @@ async def async_setup_entry(
                 )
                 entities_to_add.append(new_sensor)
                 active_balance_sensors[unique_id] = new_sensor
-            elif is_zero_balance and unique_id in active_sensors:
+            elif (
+                is_zero_balance and unique_id in active_balance_sensors
+            ):  # Corrected from active_sensors
                 # Balance is zero and sensor exists, so mark for removal
                 _LOGGER.debug(
                     "Marking LunchMoneyBalanceSensor for Plaid account_id: %s for removal (balance: %s)",
@@ -598,9 +604,15 @@ class LunchMoneyNetWorthSensor(CoordinatorEntity, SensorEntity):
         )
 
         total_net_worth = Decimal("0.0")
-        user_primary_currency = getattr(user_data, "currency", None)
+
+        # Prioritize primary currency from config options, then fallback to user data
+        user_primary_currency = self._config_entry.options.get(CONF_PRIMARY_CURRENCY)
         if user_primary_currency:
             user_primary_currency = user_primary_currency.lower()
+        elif user_data:
+            user_primary_currency = getattr(user_data, "currency", None)
+            if user_primary_currency:
+                user_primary_currency = user_primary_currency.lower()
 
         # Sum from manual assets (using 'to_base')
         for asset_data in manual_assets.values():
