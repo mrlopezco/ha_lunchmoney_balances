@@ -5,6 +5,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from .const import DOMAIN, CONF_API_KEY, CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL
 from lunchable import LunchMoney
+from lunchable.models import PlaidAccountObject  # Import PlaidAccountObject
 
 _LOGGER = logging.getLogger(__name__)
 PLATFORMS = ["sensor"]
@@ -27,6 +28,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             manual_assets_list = await hass.async_add_executor_job(
                 lunch_money_api.get_assets
             )
+            # Fetch Plaid accounts
             plaid_accounts_list = await hass.async_add_executor_job(
                 lunch_money_api.get_plaid_accounts
             )
@@ -66,13 +68,31 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     manual_assets_list,
                 )
 
+            # Process Plaid accounts
             if plaid_accounts_list and isinstance(plaid_accounts_list, list):
                 _LOGGER.debug(
                     "Plaid accounts list found with %s items.", len(plaid_accounts_list)
                 )
-                processed_data["plaid_accounts"] = {
-                    account.id: account for account in plaid_accounts_list
-                }
+                # Ensure each item is a PlaidAccountObject and store by ID
+                valid_plaid_accounts = []
+                for account in plaid_accounts_list:
+                    if isinstance(account, PlaidAccountObject) and hasattr(
+                        account, "id"
+                    ):
+                        valid_plaid_accounts.append(account)
+                    else:
+                        _LOGGER.warning(
+                            "Invalid Plaid account object found: %s", account
+                        )
+
+                if not valid_plaid_accounts:
+                    _LOGGER.warning(
+                        "Plaid accounts list was empty after filtering for valid objects."
+                    )
+                else:
+                    processed_data["plaid_accounts"] = {
+                        account.id: account for account in valid_plaid_accounts
+                    }
             else:
                 _LOGGER.warning(
                     "No Plaid accounts list found or response was not a list. Fetched: %s",

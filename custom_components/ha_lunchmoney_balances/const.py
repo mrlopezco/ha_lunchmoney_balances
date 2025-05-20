@@ -1,3 +1,4 @@
+# File: custom_components/ha_lunchmoney_balances/const.py
 """Constants for the Lunch Money Balances integration."""
 
 # This is the most important part to match your folder and intended domain

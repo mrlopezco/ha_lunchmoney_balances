@@ -1,3 +1,4 @@
+# File: custom_components/ha_lunchmoney_balances/sensor.py
 """Sensor platform for Lunch Money Balances integration."""
 
 import logging
@@ -130,7 +131,7 @@ class LunchMoneyBalanceSensor(CoordinatorEntity, SensorEntity):
 
     def _get_item_data(
         self,
-    ) -> any | None:  # Any can be AssetsObject or PlaidAccountObject
+    ) -> Any | None:  # Any can be AssetsObject or PlaidAccountObject
         """Helper to safely get item data from the coordinator."""
         data_key = "plaid_accounts" if self._is_plaid else "manual_assets"
         if (
@@ -305,8 +306,13 @@ class LunchMoneyBalanceSensor(CoordinatorEntity, SensorEntity):
             if to_base_val is not None:
                 try:
                     attrs["to_base_currency_value"] = float(Decimal(str(to_base_val)))
-                except:
-                    attrs["to_base_currency_value"] = to_base_val
+                except (InvalidOperation, ValueError, TypeError):
+                    _LOGGER.error(
+                        "Could not parse to_base_currency_value '%s' for manual asset %s",
+                        to_base_val,
+                        self._item_id,
+                    )
+                    attrs["to_base_currency_value"] = None  # Set to None on error
             balance_as_of_val = getattr(
                 item_data, "balance_as_of", None
             )  # str or datetime
