@@ -1,6 +1,3 @@
 {
-  "name": "Lunch Money Balance",
-  "content_in_root": false,
-  "homeassistant": "2025.5.0",
-  "render_readme": true
+  "name": "Lunch Money Balances"
 }
