@@ -2,6 +2,7 @@ import logging
 from typing import Any
 
 import voluptuous as vol
+from requests.exceptions import HTTPError, RequestException
 
 from homeassistant import config_entries
 from homeassistant.core import callback
@@ -9,10 +10,7 @@ from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.aiohttp_client import (
     async_get_clientsession,
 )  # Import for API calls
-from lunchable import (
-    LunchMoney,
-    LunchMoneyAPIError,
-)  # Corrected import for LunchMoneyAPIError
+from lunchable import LunchMoney
 
 from .const import (
     DOMAIN,
@@ -25,19 +23,35 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 
-async def validate_api_key(hass: Any, api_key: str) -> bool:
+async def validate_api_key(hass: Any, api_key: str) -> None:
     """Validate the API key by trying to fetch assets."""
     try:
         lunch_money_api = LunchMoney(access_token=api_key)
-        # The library might make a synchronous call, wrap it
+        # Use hass.async_add_executor_job for blocking I/O calls
         await hass.async_add_executor_job(lunch_money_api.get_assets)
-        return True
-    except LunchMoneyAPIError as e:
-        _LOGGER.error("Lunch Money API Error during validation: %s", e)
-        raise  # Re-raise to be caught in the flow
-    except Exception as e:  # Catch any other unexpected errors during validation
-        _LOGGER.error("Unexpected error during API key validation: %s", e)
-        raise ConnectionError("Cannot connect to Lunch Money API")
+    except HTTPError as http_err:
+        _LOGGER.error(
+            "Lunch Money API HTTP Error during validation: %s (Status: %s)",
+            http_err,
+            http_err.response.status_code if http_err.response else "N/A",
+        )
+        # Re-raise HTTPError to be specifically handled by the caller
+        raise
+    except (
+        RequestException
+    ) as req_err:  # Catch other requests-related errors (connection, timeout)
+        _LOGGER.error(
+            "Lunch Money API Request Exception during validation: %s", req_err
+        )
+        raise ConnectionError(f"Cannot connect to Lunch Money API: {req_err}")
+    except Exception as e:  # Catch any other unexpected error during the API call
+        _LOGGER.exception(
+            "Unexpected error during API key validation via lunchable library"
+        )
+        # Raise a ConnectionError to map to "cannot_connect" or a generic error in the flow
+        raise ConnectionError(
+            f"Unexpected error communicating with Lunch Money API: {e}"
+        )
 
 
 class LunchMoneyBalanceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -56,27 +70,42 @@ class LunchMoneyBalanceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
             try:
                 await validate_api_key(self.hass, api_key)
-            except LunchMoneyAPIError:
-                errors["base"] = "invalid_auth"
-                _LOGGER.error("Invalid Lunch Money API key provided.")
-            except ConnectionError:
-                errors["base"] = "cannot_connect"
-                _LOGGER.error("Could not connect to Lunch Money API during setup.")
-            except Exception:  # pylint: disable=broad-except
-                _LOGGER.exception("Unexpected error during authentication test")
-                errors["base"] = "unknown"
-            else:
-                await self.async_set_unique_id(
-                    api_key
-                )  # Set unique_id to prevent duplicate entries for the same API key
+                # If validate_api_key doesn't raise, proceed
+                await self.async_set_unique_id(api_key)
                 self._abort_if_unique_id_configured()
                 return self.async_create_entry(
-                    title="Lunch Money Balance",  # You can make this more dynamic, e.g., user's Lunch Money name if available
+                    title="Lunch Money Balances",  # Updated title to match domain if desired
                     data={
                         CONF_API_KEY: api_key,
                         CONF_UPDATE_INTERVAL: update_interval,
                     },
                 )
+            except HTTPError as http_err:
+                if (
+                    http_err.response is not None
+                    and http_err.response.status_code == 401
+                ):
+                    _LOGGER.error("Invalid Lunch Money API key (HTTP 401).")
+                    errors["base"] = "invalid_auth"
+                else:
+                    _LOGGER.error(
+                        "Lunch Money API returned an HTTP error: %s", http_err
+                    )
+                    errors["base"] = "cannot_connect"  # Or a more specific "api_error"
+            except (
+                ConnectionError
+            ) as conn_err:  # Raised by validate_api_key for network or unexpected issues
+                _LOGGER.error(
+                    "Could not connect to Lunch Money API during setup: %s", conn_err
+                )
+                errors["base"] = "cannot_connect"
+            except (
+                config_entries.OperationNotAllowed
+            ):  # For _abort_if_unique_id_configured
+                return self.async_abort(reason="already_configured")
+            except Exception:  # pylint: disable=broad-except
+                _LOGGER.exception("Unexpected error during authentication test")
+                errors["base"] = "unknown"
 
         data_schema = vol.Schema(
             {
