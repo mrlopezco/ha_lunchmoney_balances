@@ -1,4 +1,3 @@
-# File: custom_components/ha_lunchmoney_balances/sensor.py
 """Sensor platform for Lunch Money Balances integration."""
 
 import logging
@@ -57,6 +56,9 @@ async def async_setup_entry(
     # Store the add_entities callback and a dictionary to track active sensors
     # This allows the coordinator update listener to dynamically add/remove entities
     hass.data[DOMAIN].setdefault("active_balance_sensors", {})
+    hass.data[DOMAIN].setdefault(
+        "active_currency_net_worth_sensors", {}
+    )  # New: for currency net worth sensors
     hass.data[DOMAIN]["add_balance_entities_callback"] = async_add_entities
 
     _LOGGER.debug("Sensor setup: Full coordinator data: %s", coordinator.data)
@@ -82,15 +84,24 @@ async def async_setup_entry(
             )
             return
 
-        active_sensors: Dict[str, LunchMoneyBalanceSensor] = hass.data[DOMAIN][
+        active_balance_sensors: Dict[str, LunchMoneyBalanceSensor] = hass.data[DOMAIN][
             "active_balance_sensors"
         ]
+        active_currency_net_worth_sensors: Dict[
+            str, LunchMoneyNetWorthCurrencySensor
+        ] = hass.data[DOMAIN][
+            "active_currency_net_worth_sensors"
+        ]  # New
         add_entities_callback: AddEntitiesCallback = hass.data[DOMAIN][
             "add_balance_entities_callback"
         ]
 
-        desired_entity_ids: Set[str] = set()
+        desired_balance_entity_ids: Set[str] = set()
+        desired_currency_net_worth_entity_ids: Set[str] = set()  # New
         entities_to_add = []
+
+        # Collect all unique currencies for currency-specific net worth sensors
+        all_currencies: Set[str] = set()
 
         # Process manual assets
         manual_assets_dict = current_data.get("manual_assets", {})
@@ -114,9 +125,9 @@ async def async_setup_entry(
             )
 
             unique_id = f"{config_entry.entry_id}_manual_{asset_id}_balance"
-            desired_entity_ids.add(unique_id)
+            desired_balance_entity_ids.add(unique_id)
 
-            if not is_zero_balance and unique_id not in active_sensors:
+            if not is_zero_balance and unique_id not in active_balance_sensors:
                 # Balance is non-zero and sensor not yet created, so create it
                 _LOGGER.debug(
                     "Adding new LunchMoneyBalanceSensor for manual asset_id: %s (balance: %s)",
@@ -127,16 +138,20 @@ async def async_setup_entry(
                     coordinator, asset_id, config_entry, is_plaid=False
                 )
                 entities_to_add.append(new_sensor)
-                active_sensors[unique_id] = new_sensor
-            elif is_zero_balance and unique_id in active_sensors:
+                active_balance_sensors[unique_id] = new_sensor
+            elif is_zero_balance and unique_id in active_balance_sensors:
                 # Balance is zero and sensor exists, so mark for removal
                 _LOGGER.debug(
                     "Marking LunchMoneyBalanceSensor for manual asset_id: %s for removal (balance: %s)",
                     asset_id,
                     parsed_balance,
                 )
-                # We can't remove directly here, but we will collect entities to remove later
                 pass  # Handled in the removal loop below
+
+            # Collect currency for currency-specific net worth
+            currency = getattr(asset_data, "currency", None)
+            if currency:
+                all_currencies.add(currency.upper())
 
         # Process Plaid accounts
         plaid_accounts_dict = current_data.get("plaid_accounts", {})
@@ -150,9 +165,9 @@ async def async_setup_entry(
             )
 
             unique_id = f"{config_entry.entry_id}_plaid_{account_id}_balance"
-            desired_entity_ids.add(unique_id)
+            desired_balance_entity_ids.add(unique_id)
 
-            if not is_zero_balance and unique_id not in active_sensors:
+            if not is_zero_balance and unique_id not in active_balance_sensors:
                 # Balance is non-zero and sensor not yet created, so create it
                 _LOGGER.debug(
                     "Adding new LunchMoneyBalanceSensor for Plaid account_id: %s (balance: %s)",
@@ -163,7 +178,7 @@ async def async_setup_entry(
                     coordinator, account_id, config_entry, is_plaid=True
                 )
                 entities_to_add.append(new_sensor)
-                active_sensors[unique_id] = new_sensor
+                active_balance_sensors[unique_id] = new_sensor
             elif is_zero_balance and unique_id in active_sensors:
                 # Balance is zero and sensor exists, so mark for removal
                 _LOGGER.debug(
@@ -173,22 +188,27 @@ async def async_setup_entry(
                 )
                 pass  # Handled in the removal loop below
 
-        # Add new entities
+            # Collect currency for currency-specific net worth
+            currency = getattr(account_data, "currency", None)
+            if currency:
+                all_currencies.add(currency.upper())
+
+        # Add new individual balance entities
         if entities_to_add:
             _LOGGER.debug(
                 "Adding %d new balance sensor entities.", len(entities_to_add)
             )
             add_entities_callback(entities_to_add, True)
 
-        # Remove entities that are no longer desired (balance became zero)
+        # Remove individual balance entities that are no longer desired (balance became zero)
         entities_to_remove = []
         for unique_id, sensor_instance in list(
-            active_sensors.items()
+            active_balance_sensors.items()
         ):  # Iterate over a copy
-            if unique_id not in desired_entity_ids:
+            if unique_id not in desired_balance_entity_ids:
                 _LOGGER.debug("Removing balance sensor entity: %s", unique_id)
                 entities_to_remove.append(sensor_instance)
-                del active_sensors[unique_id]  # Remove from our tracking dict
+                del active_balance_sensors[unique_id]  # Remove from our tracking dict
 
         for sensor_instance in entities_to_remove:
             if sensor_instance.hass:  # Ensure it's still attached to Home Assistant
@@ -196,8 +216,50 @@ async def async_setup_entry(
                     force_remove=True
                 )  # Force remove from HA registry
 
-        # Update existing entities (those that remain active)
-        for sensor_instance in active_sensors.values():
+        # Update existing individual balance entities (those that remain active)
+        for sensor_instance in active_balance_sensors.values():
+            sensor_instance.async_write_ha_state()  # Trigger state update for existing sensors
+
+        # --- Manage Currency-specific Net Worth Sensors ---
+        currency_net_worth_entities_to_add = []
+        for currency_code in all_currencies:
+            unique_id = f"{config_entry.entry_id}_{NET_WORTH_SENSOR_ID_SUFFIX}_{currency_code.lower()}"
+            desired_currency_net_worth_entity_ids.add(unique_id)
+
+            if unique_id not in active_currency_net_worth_sensors:
+                _LOGGER.debug(
+                    "Adding new LunchMoneyNetWorthCurrencySensor for currency: %s",
+                    currency_code,
+                )
+                new_sensor = LunchMoneyNetWorthCurrencySensor(
+                    coordinator, config_entry, currency_code
+                )
+                currency_net_worth_entities_to_add.append(new_sensor)
+                active_currency_net_worth_sensors[unique_id] = new_sensor
+
+        if currency_net_worth_entities_to_add:
+            _LOGGER.debug(
+                "Adding %d new currency net worth sensor entities.",
+                len(currency_net_worth_entities_to_add),
+            )
+            add_entities_callback(currency_net_worth_entities_to_add, True)
+
+        currency_entities_to_remove = []
+        for unique_id, sensor_instance in list(
+            active_currency_net_worth_sensors.items()
+        ):
+            if unique_id not in desired_currency_net_worth_entity_ids:
+                _LOGGER.debug(
+                    "Removing currency net worth sensor entity: %s", unique_id
+                )
+                currency_entities_to_remove.append(sensor_instance)
+                del active_currency_net_worth_sensors[unique_id]
+
+        for sensor_instance in currency_entities_to_remove:
+            if sensor_instance.hass:
+                sensor_instance.async_remove(force_remove=True)
+
+        for sensor_instance in active_currency_net_worth_sensors.values():
             sensor_instance.async_write_ha_state()  # Trigger state update for existing sensors
 
     # Add the listener to the coordinator
@@ -389,6 +451,7 @@ class LunchMoneyBalanceSensor(CoordinatorEntity, SensorEntity):
             configuration_url="https://my.lunchmoney.app/"
             + ("plaid" if self._is_plaid else "assets"),
             via_device=(DOMAIN, self._config_entry.entry_id),
+            icon="mdi:currency-usd",  # Added dollar icon
         )
 
     @property
@@ -637,6 +700,136 @@ class LunchMoneyNetWorthSensor(CoordinatorEntity, SensorEntity):
         )
         return DeviceInfo(
             identifiers={(DOMAIN, f"{self._config_entry.entry_id}_summary")},
+            name=NET_WORTH_DEVICE_NAME,
+            manufacturer="Lunch Money",
+            model="Account Summary Integration",
+        )
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        self._update_internal_state()
+        self.async_write_ha_state()
+
+    @property
+    def entity_registry_enabled_default(self) -> bool:
+        return True
+
+
+class LunchMoneyNetWorthCurrencySensor(CoordinatorEntity, SensorEntity):
+    """Representation of the Net Worth for a specific currency from Lunch Money assets."""
+
+    _attr_state_class = SensorStateClass.TOTAL
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_attribution = ATTRIBUTION
+
+    def __init__(
+        self,
+        coordinator: DataUpdateCoordinator,
+        config_entry: ConfigEntry,
+        currency_code: str,
+    ) -> None:
+        """Initialize the currency-specific Net Worth sensor."""
+        super().__init__(coordinator)
+        self._config_entry = config_entry
+        self._currency_code = currency_code.upper()
+        self._attr_name = f"{NET_WORTH_DEVICE_NAME} Net Worth ({self._currency_code})"
+        self._attr_unique_id = f"{self._config_entry.entry_id}_{NET_WORTH_SENSOR_ID_SUFFIX}_{self._currency_code.lower()}"
+        self._update_internal_state()
+
+    def _get_manual_asset_data(self) -> dict:
+        if self.coordinator.data and "manual_assets" in self.coordinator.data:
+            return self.coordinator.data["manual_assets"]
+        return {}
+
+    def _get_plaid_account_data(self) -> dict:
+        if self.coordinator.data and "plaid_accounts" in self.coordinator.data:
+            return self.coordinator.data["plaid_accounts"]
+        return {}
+
+    def _update_internal_state(self) -> None:
+        """Update the sensor's state, summing from manual and Plaid accounts for this currency."""
+        manual_assets = self._get_manual_asset_data()
+        plaid_accounts = self._get_plaid_account_data()
+
+        inverted_types_config = self._config_entry.options.get(
+            CONF_INVERTED_ASSET_TYPES, DEFAULT_INVERTED_ASSET_TYPES
+        )
+
+        currency_net_worth = Decimal("0.0")
+
+        # Sum from manual assets
+        for asset_data in manual_assets.values():
+            asset_currency = getattr(asset_data, "currency", None)
+            if asset_currency and asset_currency.upper() == self._currency_code:
+                # For manual assets, 'balance' is the direct balance in its currency.
+                # 'to_base' is conversion to primary currency. We want the native currency balance here.
+                raw_balance_str = getattr(asset_data, "balance", None)
+                parsed_balance = None
+                if raw_balance_str is not None:
+                    try:
+                        parsed_balance = Decimal(str(raw_balance_str))
+                    except (InvalidOperation, ValueError, TypeError):
+                        _LOGGER.error(
+                            "Could not parse balance string '%s' for manual asset %s (currency %s) for currency net worth: %s",
+                            raw_balance_str,
+                            getattr(asset_data, "id", "N/A"),
+                            self._currency_code,
+                        )
+                        parsed_balance = None  # Ensure it's None on error
+
+                if parsed_balance is not None:
+                    asset_type = getattr(asset_data, "type_name", "").lower()
+                    if asset_type in inverted_types_config:
+                        currency_net_worth -= parsed_balance
+                    else:
+                        currency_net_worth += parsed_balance
+
+        # Sum from Plaid accounts
+        for plaid_account_data in plaid_accounts.values():
+            plaid_currency = getattr(plaid_account_data, "currency", None)
+            if plaid_currency and plaid_currency.upper() == self._currency_code:
+                plaid_balance = getattr(
+                    plaid_account_data, "balance", None
+                )  # Already a float or None
+
+                if plaid_balance is not None:
+                    try:
+                        balance_value = Decimal(str(plaid_balance))
+                        account_type = getattr(plaid_account_data, "type", "").lower()
+                        if account_type in inverted_types_config:
+                            currency_net_worth -= balance_value
+                        else:
+                            currency_net_worth += balance_value
+                    except (InvalidOperation, ValueError, TypeError) as e:
+                        _LOGGER.error(
+                            "Error processing balance for Plaid account %s (currency %s) for currency net worth: %s",
+                            getattr(plaid_account_data, "id", "N/A"),
+                            self._currency_code,
+                            e,
+                        )
+
+        self._attr_native_value = float(currency_net_worth)
+        self._attr_native_unit_of_measurement = self._currency_code
+        self._attr_icon = f"mdi:currency-{self._currency_code.lower()}"  # Dynamic icon based on currency
+
+    @property
+    def available(self) -> bool:
+        """Return True if entity is available (i.e., coordinator has data)."""
+        return super().available and self.coordinator.data is not None
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Return information for the Net Worth device. This device acts as the main integration device."""
+        _LOGGER.debug(
+            "Device Info for Currency Net Worth Sensor (Main Integration Device): Entry ID %s, Currency %s",
+            self._config_entry.entry_id,
+            self._currency_code,
+        )
+        return DeviceInfo(
+            identifiers={
+                (DOMAIN, f"{self._config_entry.entry_id}_summary")
+            },  # Link to the main summary device
             name=NET_WORTH_DEVICE_NAME,
             manufacturer="Lunch Money",
             model="Account Summary Integration",
