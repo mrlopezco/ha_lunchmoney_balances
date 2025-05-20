@@ -1,4 +1,3 @@
-# File: custom_components/ha_lunchmoney_balances/const.py
 """Constants for the Lunch Money Balances integration."""
 
 # This is the most important part to match your folder and intended domain
@@ -8,6 +7,9 @@ DOMAIN = "ha_lunchmoney_balances"
 CONF_API_KEY = "api_key"
 CONF_UPDATE_INTERVAL = "update_interval"
 CONF_INVERTED_ASSET_TYPES = "inverted_asset_types"
+CONF_PRIMARY_CURRENCY = (
+    "primary_currency"  # New: Primary currency for net worth calculation
+)
 
 # Default values
 DEFAULT_UPDATE_INTERVAL = 720  # 12 hours in minutes
