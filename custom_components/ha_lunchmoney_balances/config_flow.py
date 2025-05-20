@@ -10,6 +10,9 @@ from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.aiohttp_client import (
     async_get_clientsession,
 )  # Import for API calls
+
+from awesomeversion import AwesomeVersion
+from homeassistant.const import __version__ as HAVERSION
 from lunchable import LunchMoney
 
 from .const import (
@@ -138,7 +141,8 @@ class LunchMoneyBalanceOptionsFlowHandler(config_entries.OptionsFlow):
 
     def __init__(self, config_entry: config_entries.ConfigEntry):
         """Initialize options flow."""
-        self.config_entry = config_entry
+            if AwesomeVersion(HAVERSION) < "2024.11.99":
+                self.config_entry = config_entry
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None

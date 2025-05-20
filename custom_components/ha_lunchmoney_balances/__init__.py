@@ -26,18 +26,42 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         """Fetch data from Lunch Money API."""
         try:
             # Use hass.async_add_executor_job for blocking I/O calls
-            assets = await hass.async_add_executor_job(lunch_money_api.get_assets)
-            _LOGGER.debug("Fetched Lunch Money assets: %s", assets)
-            if assets and hasattr(assets, "assets"):
-                return {
-                    asset.id: asset for asset in assets.assets
-                }  # Store assets by their ID for easy lookup
-            _LOGGER.warning(
-                "No assets found or assets attribute missing in API response."
+            assets_object = await hass.async_add_executor_job(
+                lunch_money_api.get_assets
             )
-            return {}
+            _LOGGER.debug("Fetched Lunch Money assets_object: %s", assets_object)
+            # For more detailed debugging of what lunchable returns:
+            # if hasattr(assets_object, '__dict__'):
+            #     _LOGGER.debug("Assets_object attributes: %s", vars(assets_object))
+            # elif isinstance(assets_object, list):
+            #    _LOGGER.debug("Assets_object is a list of length: %s", len(assets_object))
+
+            # The lunchable library's get_assets() method returns an object (e.g., AssetsObject)
+            # which should have an 'assets' attribute that is a list of individual asset objects.
+            if (
+                assets_object
+                and hasattr(assets_object, "assets")
+                and assets_object.assets
+            ):
+                # Ensure assets_object.assets is not None and not an empty list
+                _LOGGER.debug("Assets found: %s", len(assets_object.assets))
+                return {
+                    asset.id: asset for asset in assets_object.assets
+                }  # Store assets by their ID for easy lookup
+
+            _LOGGER.warning(
+                "No assets list found in API response, or the assets list is empty. Assets Object: %s",
+                assets_object,
+            )
+            return (
+                {}
+            )  # Return empty dict if no assets or issues with the response structure
         except Exception as err:
             _LOGGER.error("Error fetching Lunch Money assets: %s", err)
+            # Log the exception with traceback for more details
+            _LOGGER.exception(
+                "Full exception details for error fetching Lunch Money assets:"
+            )
             raise UpdateFailed(f"Error communicating with API: {err}")
 
     coordinator = DataUpdateCoordinator(
