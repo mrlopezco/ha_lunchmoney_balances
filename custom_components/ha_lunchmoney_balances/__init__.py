@@ -25,17 +25,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         """Fetch data from Lunch Money API, including assets and user info."""
         try:
             assets_list = await hass.async_add_executor_job(lunch_money_api.get_assets)
-            user_info = await hass.async_add_executor_job(
-                lunch_money_api.get_user_details
-            )  # Fetches user details
 
             _LOGGER.debug("Fetched Lunch Money assets list: %s", assets_list)
-            _LOGGER.debug("Fetched Lunch Money user info: %s", user_info)
 
             processed_data = {"assets": {}, "user": None}
-
-            if user_info:
-                processed_data["user"] = user_info  # Store the UserObject
 
             if assets_list and isinstance(assets_list, list):
                 _LOGGER.debug("Assets list found with %s items.", len(assets_list))
